@@ -2,6 +2,13 @@
 set -euo pipefail
 
 # =====================================================================================================================================
+#    https://github.com/clynton/install-cursor
+#    others:
+#       https://github.com/alisouran/install-cursor 
+#       https://github.com/cloudmaker97/Cursor-AppImage-Installer
+#       https://forum.cursor.com/t/downloader-cursor-sh-linux-appimage-x64-no-longer-has-the-most-recent-app-image/63862/5
+#       search for "Cursor AppImage versions"
+# 
 # Cursor install/update (AppImage) for Linux - ARM / x64 !
 # This script handles the complete user-level install/update process for cursor. i.e. won't install as root just because sudo given
 #
@@ -28,7 +35,7 @@ set -euo pipefail
 # It will:
 #   - Detect your system architecture (x64 or ARM) and download the latest stable Linux AppImage automatically
 #   - Pin the AppImage to: ~/Applications/Cursor/Cursor.AppImage
-#   - Create ~/.local/bin/cursor (runs with sandbox first, falls back to --no-sandbox; if FUSE missing, extract+run)
+#   - Create ~/.local/bin/cursor (runs the pinned AppImage directly)
 #   - Create or update the launcher entry with a fixed icon so it appears in the app panel
 #   - Clean up any stray squashfs-root folders left by AppImage extraction
 #
@@ -138,6 +145,27 @@ ensure_dirs(){
   mkdir -p "$BASE_DIR" "$EXTRACT_DIR" "$BIN_DIR" "$DESKTOP_DIR" "$ICON_DIR"
   if [[ "$EUID_NUM" -eq 0 ]]; then
     chown -R "$TARGET_USER":"$TARGET_USER" "$TARGET_HOME/.local" "$TARGET_HOME/Applications" 2>/dev/null || true
+  fi
+}
+
+get_appimage_version(){
+  local app="$1"
+  local tmp="" pkg="" ver=""
+  [[ -f "$app" ]] || { printf 'not installed\n'; return 0; }
+
+  tmp="$(mktemp -d)"
+  if ( cd "$tmp" && "$app" --appimage-extract >/dev/null 2>&1 ); then
+    pkg="$tmp/squashfs-root/usr/share/cursor/resources/app/package.json"
+    if [[ -f "$pkg" ]]; then
+      ver="$(sed -n 's/.*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$pkg" | head -n1 | tr -d '\r')"
+    fi
+  fi
+  rm -rf "$tmp" 2>/dev/null || true
+
+  if [[ -n "${ver:-}" ]]; then
+    printf '%s\n' "$ver"
+  else
+    printf 'unknown\n'
   fi
 }
 
@@ -252,7 +280,7 @@ write_wrapper(){
   cat > "$WRAPPER" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-exec "$HOME/Applications/Cursor/cursor-extracted/squashfs-root/AppRun" "$@"
+exec "$HOME/Applications/Cursor/Cursor.AppImage" "$@"
 EOF
   chmod +x "$WRAPPER"
   if [[ "$EUID_NUM" -eq 0 ]]; then
@@ -407,10 +435,12 @@ runtime_test_background_kill() {
   log "Runtime test: launching Cursor briefly (10s) then killing it..."
 
   have_cmd setsid || { log "setsid not available; skipping runtime test."; return 0; }
-  [[ -x "$APP_RUN" ]] || { log "AppRun missing; skipping runtime test."; return 0; }
+  [[ -x "$STABLE_APPIMAGE" ]] || { log "AppImage missing; skipping runtime test."; return 0; }
+  local rt_tmp=""
+  rt_tmp="$(mktemp -d)"
 
-  # Start in new session/process group
-  setsid "$APP_RUN" >/dev/null 2>&1 &
+  # Run from a temp dir so AppImage extraction never leaves squashfs-root in Desktop/CWD.
+  setsid bash -lc "cd '$rt_tmp' && exec '$STABLE_APPIMAGE'" >/dev/null 2>&1 &
   local pid=$!
 
   # Let it initialize
@@ -427,14 +457,24 @@ runtime_test_background_kill() {
   fi
 
   wait "$pid" 2>/dev/null || true
+  rm -rf "$rt_tmp" 2>/dev/null || true
   log "Runtime test complete."
+}
+
+cleanup_extracted_content() {
+  # Extraction is only needed during install; remove it afterward.
+  rm -rf "$EXTRACT_DIR" 2>/dev/null || true
+  rm -rf "$BASE_DIR/squashfs-root" 2>/dev/null || true
 }
 
 # -----------------------------
 # Duplicate scan + optional deletion (no version/time reliance)
 # -----------------------------
 scan_duplicates() {
-  find "$TARGET_HOME" -maxdepth 4 -type f \( -iname "*cursor*.AppImage" -o -iname "*cursor*.desktop" \) 2>/dev/null || true
+  find "$TARGET_HOME" -maxdepth 4 \( \
+    -type f \( -iname "*cursor*.AppImage" -o -iname "*cursor*.desktop" \) \
+    -o -type d -name "squashfs-root" \
+  \) 2>/dev/null || true
 }
 
 cleanup_duplicates_confirmed() {
@@ -467,6 +507,13 @@ cleanup_duplicates_confirmed() {
       continue
     fi
 
+    if [[ -d "$f" ]]; then
+      case "${f##*/}" in
+        squashfs-root) candidates+="$f"$'\n' ;;
+      esac
+      continue
+    fi
+
     case "${f,,}" in
       *.appimage|*.desktop) candidates+="$f"$'\n' ;;
     esac
@@ -493,7 +540,11 @@ cleanup_duplicates_confirmed() {
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     log "Deleting: $f"
-    rm -f -- "$f" 2>/dev/null || true
+    if [[ -d "$f" ]]; then
+      rm -rf -- "$f" 2>/dev/null || true
+    else
+      rm -f -- "$f" 2>/dev/null || true
+    fi
   done <<< "$candidates"
 }
 
@@ -518,14 +569,28 @@ main(){
   log "Pre-scan for existing Cursor instances (before install):"
   cleanup_duplicates_confirmed || true
 
-  local app tmp=""
+  local app tmp="" api="" url="" ver=""
+  local current_ver="not installed"
+  local new_ver="unknown"
   if [[ -n "$APPIMAGE_INPUT" ]]; then
+    if [[ -x "$STABLE_APPIMAGE" ]]; then
+      current_ver="$(get_appimage_version "$STABLE_APPIMAGE")"
+    fi
+    new_ver="$(get_appimage_version "$APPIMAGE_INPUT")"
+    log "Current installed version: $current_ver"
+    log "New version to install:    $new_ver"
     app="$APPIMAGE_INPUT"
   else
+    if [[ -x "$STABLE_APPIMAGE" ]]; then
+      current_ver="$(get_appimage_version "$STABLE_APPIMAGE")"
+    fi
     api="$(get_latest)"
     url="${api%%|*}"
     ver="${api##*|}"
-    log "Latest Cursor version: $ver"
+    new_ver="$ver"
+    log "Current installed version: $current_ver"
+    log "New version to install:    $new_ver"
+    log "Download URL:              $url"
     app="$(download_appimage "$url")"
     tmp="$(dirname "$app")"
   fi
@@ -544,6 +609,8 @@ main(){
   ensure_path
   write_desktop
 
+  cleanup_extracted_content
+
   # Default: interactive runtime test (brief launch + kill).
   # Headless: skip runtime test entirely.
   if [[ "$HEADLESS" -eq 0 ]]; then
@@ -558,7 +625,7 @@ main(){
   log "Done."
   log "Target user:     $TARGET_USER"
   log "AppImage:        $STABLE_APPIMAGE"
-  log "Extracted:       $EXTRACT_DIR"
+  log "Extracted:       cleaned up"
   log "CLI command:     $WRAPPER"
   log "Desktop entry:   $DESKTOP_FILE"
 }
