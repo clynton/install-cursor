@@ -250,6 +250,12 @@ fix_sandbox(){
   fi
   [[ -n "${sb:-}" && -f "$sb" ]] || { log "Warning: chrome-sandbox not found."; return 0; }
 
+  # If run with sudo, keep runtime files user-owned for normal execution.
+  # The sandbox helper itself must be root-owned + setuid.
+  if [[ "$EUID_NUM" -eq 0 ]]; then
+    chown -R "$TARGET_USER":"$TARGET_USER" "$EXTRACT_DIR/squashfs-root" 2>/dev/null || true
+  fi
+
   as_root "chown root:root '$sb' 2>/dev/null || true"
   as_root "chmod 4755 '$sb' 2>/dev/null || true"
 
@@ -280,7 +286,15 @@ write_wrapper(){
   cat > "$WRAPPER" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-exec "$HOME/Applications/Cursor/Cursor.AppImage" "$@"
+APP_RUN="$HOME/Applications/Cursor/cursor-extracted/squashfs-root/AppRun"
+
+if [[ ! -x "$APP_RUN" ]]; then
+  echo "Cursor runtime not found: $APP_RUN" >&2
+  echo "Re-run cursor-installer.sh to repair the installation." >&2
+  exit 1
+fi
+
+exec "$APP_RUN" "$@"
 EOF
   chmod +x "$WRAPPER"
   if [[ "$EUID_NUM" -eq 0 ]]; then
@@ -435,35 +449,64 @@ runtime_test_background_kill() {
   log "Runtime test: launching Cursor briefly (10s) then killing it..."
 
   have_cmd setsid || { log "setsid not available; skipping runtime test."; return 0; }
-  [[ -x "$STABLE_APPIMAGE" ]] || { log "AppImage missing; skipping runtime test."; return 0; }
+  [[ -x "$WRAPPER" ]] || { log "Cursor wrapper missing; skipping runtime test."; return 0; }
   local rt_tmp=""
   rt_tmp="$(mktemp -d)"
+  local -a before_pids=()
+  local -a after_pids=()
+  local -a new_pids=()
 
-  # Run from a temp dir so AppImage extraction never leaves squashfs-root in Desktop/CWD.
-  setsid bash -lc "cd '$rt_tmp' && exec '$STABLE_APPIMAGE'" >/dev/null 2>&1 &
-  local pid=$!
+  # AppRun may spawn and let the launcher exit early; track real Cursor pids.
+  mapfile -t before_pids < <(pgrep -u "$TARGET_USER" -f "$BASE_DIR/cursor-extracted/squashfs-root" 2>/dev/null | sort -u || true)
+
+  setsid bash -lc "cd '$rt_tmp' && exec '$WRAPPER'" >/dev/null 2>&1 &
+  local launcher_pid=$!
 
   # Let it initialize
   sleep 10
 
-  # Kill entire process group if still alive
-  if kill -0 "$pid" 2>/dev/null; then
+  mapfile -t after_pids < <(pgrep -u "$TARGET_USER" -f "$BASE_DIR/cursor-extracted/squashfs-root" 2>/dev/null | sort -u || true)
+
+  for p in "${after_pids[@]}"; do
+    local seen=0
+    for b in "${before_pids[@]}"; do
+      if [[ "$p" == "$b" ]]; then
+        seen=1
+        break
+      fi
+    done
+    if [[ "$seen" -eq 0 ]]; then
+      new_pids+=("$p")
+    fi
+  done
+
+  if ((${#new_pids[@]} > 0)); then
     log "Runtime test: Cursor stayed running; killing test instance..."
-    kill -TERM "-$pid" 2>/dev/null || true
+    for p in "${new_pids[@]}"; do
+      kill -TERM "$p" 2>/dev/null || true
+    done
     sleep 2
-    kill -KILL "-$pid" 2>/dev/null || true
+    for p in "${new_pids[@]}"; do
+      kill -KILL "$p" 2>/dev/null || true
+    done
+  elif kill -0 "$launcher_pid" 2>/dev/null; then
+    # Fallback for unusual launch paths where pgrep misses the child process.
+    log "Runtime test: launcher still running; killing test instance..."
+    kill -TERM "-$launcher_pid" 2>/dev/null || true
+    sleep 2
+    kill -KILL "-$launcher_pid" 2>/dev/null || true
   else
-    log "Runtime test: Cursor exited before 10s (check environment if launch issues persist)."
+    log "Runtime test: no new Cursor process detected after launch window."
   fi
 
-  wait "$pid" 2>/dev/null || true
+  wait "$launcher_pid" 2>/dev/null || true
   rm -rf "$rt_tmp" 2>/dev/null || true
   log "Runtime test complete."
 }
 
 cleanup_extracted_content() {
-  # Extraction is only needed during install; remove it afterward.
-  rm -rf "$EXTRACT_DIR" 2>/dev/null || true
+  # Keep extracted runtime because wrapper executes AppRun directly.
+  # Remove only accidental extraction leftovers outside managed runtime dir.
   rm -rf "$BASE_DIR/squashfs-root" 2>/dev/null || true
 }
 
@@ -499,6 +542,11 @@ cleanup_duplicates_confirmed() {
   local candidates=""
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
+
+    # Keep the managed extracted runtime used by the wrapper launch path.
+    if [[ "$f" == "$EXTRACT_DIR/squashfs-root" ]]; then
+      continue
+    fi
 
     if [[ -n "${keep_img:-}" && "$f" == "$keep_img" ]]; then
       continue
@@ -625,7 +673,7 @@ main(){
   log "Done."
   log "Target user:     $TARGET_USER"
   log "AppImage:        $STABLE_APPIMAGE"
-  log "Extracted:       cleaned up"
+  log "Extracted:       $EXTRACT_DIR/squashfs-root (kept)"
   log "CLI command:     $WRAPPER"
   log "Desktop entry:   $DESKTOP_FILE"
 }
