@@ -17,7 +17,7 @@ This script automatically downloads and installs the latest version of
 Run this one-liner in your terminal:
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/alisouran/install-cursor/main/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/clynton/install-cursor/main/install.sh)
 ```
 
 > ⚠️ You might be prompted for your password during installation (used for
