@@ -256,24 +256,32 @@ fix_sandbox(){
   # no setuid binary — meaning this script never needs sudo for sandbox setup
   # on future installs/updates.
   #
-  # Two independent controls must both pass:
-  #   1. user.max_user_namespaces > 0  (all distros)
-  #   2. kernel.unprivileged_userns_clone = 1  (Debian/Ubuntu only; skip on
+  # Three independent controls must all pass:
+  #   1. user.max_user_namespaces > 0        (all distros)
+  #   2. kernel.unprivileged_userns_clone = 1 (Debian/Ubuntu only; skip on
   #      distros that don't ship this sysctl)
+  #   3. kernel.apparmor_restrict_unprivileged_userns = 0
+  #      (Ubuntu 23.10+ / kernel 6.2+ with AppArmor; blocks Electron/Chromium
+  #      sandbox workers — git worker, YAML server, file watcher — causing
+  #      crash-restart loops and repeated window spawning)
   # -----------------------------------------------------------------------
   _userns_ok() {
-    local max clone
+    local max clone apparmor_restrict
     max="$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo 0)"
     [[ "$max" -gt 0 ]] || return 1
     if [[ -f /proc/sys/kernel/unprivileged_userns_clone ]]; then
       clone="$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo 0)"
       [[ "$clone" -eq 1 ]] || return 1
     fi
+    if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+      apparmor_restrict="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)"
+      [[ "$apparmor_restrict" -eq 0 ]] || return 1
+    fi
     return 0
   }
 
   if _userns_ok; then
-    log "Unprivileged user namespaces already enabled."
+    log "Unprivileged user namespaces already fully enabled."
   else
     # -----------------------------------------------------------------------
     # Attempt a permanent sysctl fix (one sudo, persists across reboots).
@@ -295,10 +303,21 @@ SYSCTLEOF
       as_root "echo 'kernel.unprivileged_userns_clone = 1' >> '$sysctl_conf'" 2>/dev/null || true
     fi
 
+    # Ubuntu 23.10+ / kernel 6.2+ with AppArmor restricts unprivileged user
+    # namespaces by default. When set to 1, Electron's sandboxed subprocesses
+    # (git worker, YAML/JSON language servers, file watcher) are killed by the
+    # kernel, causing crash-restart loops, YAML server failures, and Cursor
+    # spawning repeated small recovery windows on every extension host crash.
+    if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+      as_root "echo 'kernel.apparmor_restrict_unprivileged_userns = 0' >> '$sysctl_conf'" 2>/dev/null || true
+    fi
+
     as_root "sysctl --system 1>&2" 2>/dev/null || true
 
     if _userns_ok; then
       log "Unprivileged user namespaces enabled permanently via $sysctl_conf"
+    else
+      log "Warning: unprivileged user namespaces could not be fully enabled. Cursor may exhibit sandbox errors."
     fi
   fi
 
