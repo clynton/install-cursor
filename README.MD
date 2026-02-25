@@ -7,12 +7,13 @@ This script automatically downloads and installs the latest version of
 
 - Determines which install version to fetch based on your architecture
 - Fetches the latest x64 or ARM version directly from Cursor's official API
-- Auto-detects missing shared libraries via `ldd` and installs mapped apt packages
+- Auto-detects missing shared libraries via ldd and installs mapped apt packages
 - Installs required dependencies (FUSE, libgtk, etc.)
 - Extracts the AppImage for direct execution
-- Configures Chrome sandbox via unprivileged user namespaces (permanent kernel sysctl, kernel 6.2+)
-- Falls back to setuid sandbox permissions for restricted environments
-- Creates a desktop shortcut and optional terminal command (`cursor`)
+- Enables unprivileged user namespaces via permanent kernel sysctl where not already active (kernel 6.2+)
+- Always applies setuid permissions to chrome-sandbox — Electron may prefer the setuid path even when user namespaces are available, and having both configured prevents launch failures after updates
+- Creates a desktop shortcut and optional terminal command (cursor)
+
 
 ## 📦 Quick Install
 
