@@ -273,18 +273,15 @@ fix_sandbox(){
   }
 
   if _userns_ok; then
-    log "Unprivileged user namespaces already enabled — no sandbox fix required."
-    return 0
-  fi
+    log "Unprivileged user namespaces already enabled."
+  else
+    # -----------------------------------------------------------------------
+    # Attempt a permanent sysctl fix (one sudo, persists across reboots).
+    # -----------------------------------------------------------------------
+    log "Unprivileged user namespaces not fully enabled; writing permanent sysctl config..."
+    local sysctl_conf="/etc/sysctl.d/99-cursor-userns.conf"
 
-  # -----------------------------------------------------------------------
-  # Attempt a permanent sysctl fix (one sudo, persists across reboots).
-  # On subsequent installs the _userns_ok check above will short-circuit.
-  # -----------------------------------------------------------------------
-  log "Unprivileged user namespaces not fully enabled; writing permanent sysctl config..."
-  local sysctl_conf="/etc/sysctl.d/99-cursor-userns.conf"
-
-  as_root "cat > '$sysctl_conf' <<'SYSCTLEOF'
+    as_root "cat > '$sysctl_conf' <<'SYSCTLEOF'
 # Enable unprivileged user namespaces for Chromium/Electron sandbox
 # (written by cursor-installer.sh; allows Cursor/VS Code/Chrome to sandbox
 # without a setuid chrome-sandbox binary — kernel 6.2+ / Landlock v3 path)
@@ -292,24 +289,26 @@ user.max_user_namespaces = 63359
 SYSCTLEOF
 " 2>/dev/null || true
 
-  # Debian/Ubuntu kernels gate userns behind an extra sysctl not present on
-  # vanilla kernels; add it only when the control file actually exists.
-  if [[ -f /proc/sys/kernel/unprivileged_userns_clone ]]; then
-    as_root "echo 'kernel.unprivileged_userns_clone = 1' >> '$sysctl_conf'" 2>/dev/null || true
-  fi
+    # Debian/Ubuntu kernels gate userns behind an extra sysctl not present on
+    # vanilla kernels; add it only when the control file actually exists.
+    if [[ -f /proc/sys/kernel/unprivileged_userns_clone ]]; then
+      as_root "echo 'kernel.unprivileged_userns_clone = 1' >> '$sysctl_conf'" 2>/dev/null || true
+    fi
 
-  as_root "sysctl --system 1>&2" 2>/dev/null || true
+    as_root "sysctl --system 1>&2" 2>/dev/null || true
 
-  if _userns_ok; then
-    log "Unprivileged user namespaces enabled permanently via $sysctl_conf"
-    log "Future installs/updates will not need sudo for sandbox setup."
-    return 0
+    if _userns_ok; then
+      log "Unprivileged user namespaces enabled permanently via $sysctl_conf"
+    fi
   fi
 
   # -----------------------------------------------------------------------
-  # Fallback: classic setuid chrome-sandbox (requires sudo every install).
+  # Always apply setuid chrome-sandbox. Electron may require it even when
+  # unprivileged user namespaces are enabled (observed on kernel 6.x).
+  # This is safe to apply unconditionally — it just means chrome-sandbox
+  # is always ready whichever sandboxing path Electron chooses at runtime.
   # -----------------------------------------------------------------------
-  log "sysctl fix did not take effect; falling back to setuid sandbox (best-effort)..."
+  log "Applying setuid chrome-sandbox permissions..."
 
   if [[ "$EUID_NUM" -eq 0 ]]; then
     chown -R "$TARGET_USER":"$TARGET_USER" "$EXTRACT_DIR/squashfs-root" 2>/dev/null || true
@@ -317,7 +316,7 @@ SYSCTLEOF
 
   as_root "chown root:root '$sb' 2>/dev/null || true"
   as_root "chmod 4755 '$sb' 2>/dev/null || true"
-  log "Chrome sandbox setuid permissions applied (fallback)."
+  log "Chrome sandbox setuid permissions applied."
 }
 
 copy_icon(){
